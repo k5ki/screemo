@@ -3,4 +3,13 @@ name = "screemo"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+actix = "0.13"
+actix-web = "4"
+actix-ws = "0.3"
+futures-util = "0.3"
