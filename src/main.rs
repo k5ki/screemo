@@ -1,34 +1,39 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-
 use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer,
     rt::{self},
     web,
 };
 use actix_ws::AggregatedMessage;
-
-use futures_util::StreamExt;
-use tokio::task;
+use anyhow::Result;
+use futures_util::TryStreamExt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::{sync::broadcast::error::TryRecvError, task};
 
 #[derive(Debug, Clone)]
 struct Handler {
-    counter: Arc<Mutex<i64>>,
+    qt: Arc<tokio::sync::mpsc::Sender<Message>>,
+    tt: Arc<tokio::sync::broadcast::Sender<Message>>,
 }
 
 impl Handler {
-    fn new(counter: Arc<Mutex<i64>>) -> Self {
-        Self { counter }
+    fn new(
+        qt: Arc<tokio::sync::mpsc::Sender<Message>>,
+        tt: Arc<tokio::sync::broadcast::Sender<Message>>,
+    ) -> Self {
+        Self { qt, tt }
     }
-    fn counter(&self) -> i64 {
-        let a = self.counter.lock().unwrap();
-        *a
-    }
-    fn increment(&self) {
-        let mut a = self.counter.lock().unwrap();
-        *a += 1;
+    async fn send(&self, text: &str) -> Result<()> {
+        let msg = Message {
+            text: text.to_string(),
+        };
+        self.qt
+            .send(msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to send message: {}", e))?;
+        Ok(())
     }
 }
 
@@ -41,28 +46,35 @@ async fn echo(
 
     let mut stream = stream
         .aggregate_continuations()
-        // aggregate continuation frames up to 1MiB
         .max_continuation_size(2_usize.pow(20));
 
-    // start task but don't wait for it
+    let mut rx = srv.tt.subscribe();
     rt::spawn(async move {
-        // receive messages from websocket
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(AggregatedMessage::Text(_)) => {
-                    // echo text message
-                    srv.increment();
+        loop {
+            match stream.try_next().await {
+                Ok(Some(AggregatedMessage::Text(text))) => {
+                    if !text.is_empty() {
+                        srv.send(&text).await.unwrap();
+                        session.text(format!("send: {}", text)).await.unwrap();
+                    }
+                }
+                Ok(Some(AggregatedMessage::Ping(msg))) => {
+                    session.pong(&msg).await.unwrap();
+                }
+                Err(_) => {
+                    session.close(None).await.unwrap();
+                    break;
+                }
+                _ => {}
+            }
+            match rx.try_recv() {
+                Ok(msg) => {
                     session
-                        .text(format!("count: {}", srv.counter()))
+                        .text(format!("received: {}", msg.text))
                         .await
                         .unwrap();
                 }
-
-                Ok(AggregatedMessage::Ping(msg)) => {
-                    // respond to PING frame with PONG frame
-                    session.pong(&msg).await.unwrap();
-                }
-
+                Err(TryRecvError::Empty) => {}
                 _ => {
                     session.close(None).await.unwrap();
                     break;
@@ -70,33 +82,43 @@ async fn echo(
             }
         }
     });
-
-    // respond immediately with response connected to WS session
     Ok(res)
+}
+
+#[derive(Debug, Clone)]
+struct Message {
+    text: String,
 }
 
 #[tokio::main]
 async fn main() {
     let done = Arc::new(AtomicBool::new(false));
-    let counter = Arc::new(Mutex::new(10000000000000));
+
+    let (qt, mut qr) = tokio::sync::mpsc::channel::<Message>(1000);
+    let qt = Arc::new(qt);
+
+    let (tt, mut _tr) = tokio::sync::broadcast::channel::<Message>(1000);
+    let tt = Arc::new(tt);
 
     let done_clone = done.clone();
-    let counter_clone = counter.clone();
+    let tt_clone = tt.clone();
     let fibre = task::spawn(async move {
         let done = done_clone;
-        let counter = counter_clone;
+        let tt = tt_clone;
         while !done.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let mut c = counter.lock().unwrap();
-            *c += 10000000;
+            if let Ok(msg) = qr.try_recv() {
+                tt.send(msg.clone()).unwrap();
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
         }
     });
 
     HttpServer::new(move || {
-        let handler = Handler::new(counter.clone());
+        let handler = Handler::new(qt.clone(), tt.clone());
         App::new()
             .app_data(web::Data::new(Arc::new(handler)))
-            .route("/echo", web::get().to(echo))
+            .route("/ws", web::get().to(echo))
     })
     .bind(("127.0.0.1", 8080))
     .inspect_err(|_| {
