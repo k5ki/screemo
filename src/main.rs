@@ -10,37 +10,34 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::{sync::broadcast::error::TryRecvError, task};
+use tokio::{sync::broadcast, sync::mpsc};
 
 #[derive(Debug, Clone)]
-struct Handler {
-    qt: Arc<tokio::sync::mpsc::Sender<Message>>,
-    tt: Arc<tokio::sync::broadcast::Sender<Message>>,
+struct Socket {
+    qt: Arc<mpsc::Sender<Command>>,
+    tt: Arc<broadcast::Sender<Command>>,
 }
 
-impl Handler {
-    fn new(
-        qt: Arc<tokio::sync::mpsc::Sender<Message>>,
-        tt: Arc<tokio::sync::broadcast::Sender<Message>>,
-    ) -> Self {
+impl Socket {
+    pub fn new(qt: Arc<mpsc::Sender<Command>>, tt: Arc<broadcast::Sender<Command>>) -> Self {
         Self { qt, tt }
     }
-    async fn send(&self, text: &str) -> Result<()> {
-        let msg = Message {
-            text: text.to_string(),
-        };
+    pub fn receiver(&self) -> broadcast::Receiver<Command> {
+        self.tt.subscribe()
+    }
+    pub async fn send(&self, p: Command) -> Result<()> {
         self.qt
-            .send(msg)
+            .send(p)
             .await
             .map_err(|e| anyhow::anyhow!("failed to send message: {}", e))?;
         Ok(())
     }
 }
 
-async fn echo(
+async fn terminal(
     req: HttpRequest,
     stream: web::Payload,
-    srv: web::Data<Arc<Handler>>,
+    sock: web::Data<Arc<Socket>>,
 ) -> Result<HttpResponse, Error> {
     let (res, mut session, stream) = actix_ws::handle(&req, stream)?;
 
@@ -48,14 +45,14 @@ async fn echo(
         .aggregate_continuations()
         .max_continuation_size(2_usize.pow(20));
 
-    let mut rx = srv.tt.subscribe();
+    let mut rx = sock.receiver();
     rt::spawn(async move {
         loop {
             match stream.try_next().await {
                 Ok(Some(AggregatedMessage::Text(text))) => {
+                    // TODO: parse JSON
                     if !text.is_empty() {
-                        srv.send(&text).await.unwrap();
-                        session.text(format!("send: {}", text)).await.unwrap();
+                        srv.send(Command::Connect(CommandMessage {})).await.unwrap();
                     }
                 }
                 Ok(Some(AggregatedMessage::Ping(msg))) => {
@@ -68,13 +65,14 @@ async fn echo(
                 _ => {}
             }
             match rx.try_recv() {
-                Ok(msg) => {
+                Ok(packet) => {
+                    // TODO: serialize packet to JSON
                     session
                         .text(format!("received: {}", msg.text))
                         .await
                         .unwrap();
                 }
-                Err(TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Empty) => {}
                 _ => {
                     session.close(None).await.unwrap();
                     break;
@@ -86,52 +84,84 @@ async fn echo(
 }
 
 #[derive(Debug, Clone)]
-struct Message {
-    text: String,
+enum Command {
+    Connect(CommandMessage),
+    Accept(CommandMessage),
+    Register(CommandMessage),
+    Discovered(CommandMessage),
+    SendIce(CommandMessage),
+    Cancel(CommandMessage),
+}
+
+#[derive(Debug, Clone)]
+enum Actor {
+    System,
+    User(String),
+    TempUser(String),
+}
+
+#[derive(Debug, Clone)]
+struct CommandMessage {
+    from: Actor,
+    to: Actor,
+    body: String,
+}
+
+#[derive(Debug, Clone)]
+enum IncomingMessage {
+    Connect,
+    Register(String),
+    SendIce(String),
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+enum OutgoingMessage {
+    Accept,
+    Discovered(String),
+    SendIce(String),
+    Canceled,
+    Error(String),
+}
+
+fn spawn_exchanger(
+    done: Arc<AtomicBool>,
+    t: Arc<broadcast::Sender<Command>>,
+    mut q: mpsc::Receiver<Command>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn(async move {
+        while !done.load(Ordering::Relaxed) {
+            if let Ok(msg) = q.try_recv() {
+                t.send(msg.clone()).unwrap();
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
+    })
 }
 
 #[tokio::main]
 async fn main() {
     let done = Arc::new(AtomicBool::new(false));
 
-    let (qt, mut qr) = tokio::sync::mpsc::channel::<Message>(1000);
+    let (qt, qr) = mpsc::channel::<Command>(1000);
     let qt = Arc::new(qt);
 
-    let (tt, mut _tr) = tokio::sync::broadcast::channel::<Message>(1000);
+    let (tt, mut _tr) = broadcast::channel::<Command>(1000);
     let tt = Arc::new(tt);
 
-    let done_clone = done.clone();
-    let tt_clone = tt.clone();
-    let fibre = task::spawn(async move {
-        let done = done_clone;
-        let tt = tt_clone;
-        while !done.load(Ordering::Relaxed) {
-            if let Ok(msg) = qr.try_recv() {
-                tt.send(msg.clone()).unwrap();
-            } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-        }
-    });
-
-    HttpServer::new(move || {
+    let exchanger = spawn_exchanger(done.clone(), tt.clone(), qr);
+    let server = HttpServer::new(move || {
         let handler = Handler::new(qt.clone(), tt.clone());
         App::new()
             .app_data(web::Data::new(Arc::new(handler)))
-            .route("/ws", web::get().to(echo))
+            .route("/ws", web::get().to(terminal))
     })
     .bind(("127.0.0.1", 8080))
-    .inspect_err(|_| {
-        done.store(true, Ordering::Relaxed);
-    })
-    .unwrap()
-    .run()
-    .await
-    .inspect_err(|_| {
-        done.store(true, Ordering::Relaxed);
-    })
+    .inspect_err(|_| done.store(true, Ordering::Relaxed))
     .unwrap();
 
+    server.run().await;
     done.store(true, Ordering::Relaxed);
-    fibre.await.unwrap();
+    exchanger.await;
 }
