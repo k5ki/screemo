@@ -6,6 +6,7 @@ use actix_web::{
 use actix_ws::AggregatedMessage;
 use anyhow::Result;
 use futures_util::TryStreamExt;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -49,12 +50,32 @@ async fn terminal(
     rt::spawn(async move {
         loop {
             match stream.try_next().await {
-                Ok(Some(AggregatedMessage::Text(text))) => {
-                    // TODO: parse JSON
-                    if !text.is_empty() {
-                        srv.send(Command::Connect(CommandMessage {})).await.unwrap();
+                Ok(Some(AggregatedMessage::Text(text))) => match serde_json::from_str(&text) {
+                    Ok(IncomingMessage::Connect) => {
+                        sock.send(Command::Connect(CommandMessage {
+                            from: Actor::TempUser("".to_string()),
+                            to: Actor::System,
+                            body: "".to_string(),
+                        }))
+                        .await
+                        .unwrap();
                     }
-                }
+                    Ok(IncomingMessage::Register(name)) => {
+                        sock.send(Command::Connect(CommandMessage {
+                            from: Actor::TempUser("".to_string()),
+                            to: Actor::System,
+                            body: name,
+                        }))
+                        .await
+                        .unwrap();
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let om =
+                            serde_json::to_string(&OutgoingMessage::Error(e.to_string())).unwrap();
+                        session.text(om).await.unwrap();
+                    }
+                },
                 Ok(Some(AggregatedMessage::Ping(msg))) => {
                     session.pong(&msg).await.unwrap();
                 }
@@ -65,13 +86,19 @@ async fn terminal(
                 _ => {}
             }
             match rx.try_recv() {
-                Ok(packet) => {
-                    // TODO: serialize packet to JSON
-                    session
-                        .text(format!("received: {}", msg.text))
-                        .await
-                        .unwrap();
-                }
+                #[allow(clippy::single_match)]
+                Ok(cmd) => match cmd {
+                    Command::Accept(message) => {
+                        if message.to != Actor::TempUser("".to_string()) {
+                            break;
+                        }
+                        session
+                            .text(serde_json::to_string(&OutgoingMessage::Accept).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    _ => {}
+                },
                 Err(broadcast::error::TryRecvError::Empty) => {}
                 _ => {
                     session.close(None).await.unwrap();
@@ -93,7 +120,7 @@ enum Command {
     Cancel(CommandMessage),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Actor {
     System,
     User(String),
@@ -107,7 +134,7 @@ struct CommandMessage {
     body: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum IncomingMessage {
     Connect,
     Register(String),
@@ -115,7 +142,7 @@ enum IncomingMessage {
     Cancel,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 enum OutgoingMessage {
     Accept,
     Discovered(String),
@@ -131,8 +158,19 @@ fn spawn_exchanger(
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         while !done.load(Ordering::Relaxed) {
-            if let Ok(msg) = q.try_recv() {
-                t.send(msg.clone()).unwrap();
+            if let Ok(cmd) = q.try_recv() {
+                #[allow(clippy::single_match)]
+                match cmd {
+                    Command::Connect(message) => {
+                        t.send(Command::Accept(CommandMessage {
+                            from: Actor::System,
+                            to: message.from.clone(),
+                            body: "accepted".to_string(),
+                        }))
+                        .unwrap();
+                    }
+                    _ => {}
+                }
             } else {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
@@ -152,9 +190,9 @@ async fn main() {
 
     let exchanger = spawn_exchanger(done.clone(), tt.clone(), qr);
     let server = HttpServer::new(move || {
-        let handler = Handler::new(qt.clone(), tt.clone());
+        let sock = Socket::new(qt.clone(), tt.clone());
         App::new()
-            .app_data(web::Data::new(Arc::new(handler)))
+            .app_data(web::Data::new(Arc::new(sock)))
             .route("/ws", web::get().to(terminal))
     })
     .bind(("127.0.0.1", 8080))

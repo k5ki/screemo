@@ -1095,6 +1095,8 @@ dependencies = [
  "actix-ws",
  "anyhow",
  "futures-util",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
